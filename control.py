@@ -9,6 +9,284 @@ import casadi as ca
 
 from sys_params import SYS_PARAMS
 
+class MPPIControllerForPathTracking():
+    def __init__(
+            self,
+            delta_t: float = 0.05,
+            wheel_base: float = 2.5, # [m]
+            max_steer_abs: float = 0.523, # [rad]
+            max_accel_abs: float = 2.000, # [m/s^2]
+            ref_path: np.ndarray = np.array([[0.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0]]),
+            horizon_step_T: int = 30,
+            number_of_samples_K: int = 1000,
+            param_exploration: float = 0.0,
+            param_lambda: float = 50.0,
+            param_alpha: float = 1.0,
+            sigma: np.ndarray = np.array([[0.5, 0.0], [0.0, 0.1]]), 
+            stage_cost_weight: np.ndarray = np.array([50.0, 50.0, 1.0, 20.0]), # weight for [x, y, yaw, v]
+            terminal_cost_weight: np.ndarray = np.array([50.0, 50.0, 1.0, 20.0]), # weight for [x, y, yaw, v]
+            visualize_optimal_traj = True,  # if True, optimal trajectory is visualized
+            visualze_sampled_trajs = False, # if True, sampled trajectories are visualized
+    ) -> None:
+        """initialize mppi controller for path-tracking"""
+        # mppi parameters
+        self.dim_x = 4 # dimension of system state vector
+        self.dim_u = 2 # dimension of control input vector
+        self.T = horizon_step_T # prediction horizon
+        self.K = number_of_samples_K # number of sample trajectories
+        self.param_exploration = param_exploration  # constant parameter of mppi
+        self.param_lambda = param_lambda  # constant parameter of mppi
+        self.param_alpha = param_alpha # constant parameter of mppi
+        self.param_gamma = self.param_lambda * (1.0 - (self.param_alpha))  # constant parameter of mppi
+        self.Sigma = sigma # deviation of noise
+        self.stage_cost_weight = stage_cost_weight
+        self.terminal_cost_weight = terminal_cost_weight
+        self.visualize_optimal_traj = visualize_optimal_traj
+        self.visualze_sampled_trajs = visualze_sampled_trajs
+
+        # vehicle parameters
+        self.delta_t = delta_t #[s]
+        self.wheel_base = wheel_base#[m]
+        self.max_steer_abs = max_steer_abs # [rad]
+        self.max_accel_abs = max_accel_abs # [m/s^2]
+        self.ref_path = ref_path
+
+        # mppi variables
+        self.u_prev = np.zeros((self.T, self.dim_u))
+
+        # ref_path info
+        self.prev_waypoints_idx = 0
+
+    def calc_control_input(self, observed_x: np.ndarray) -> Tuple[float, np.ndarray]:
+        """calculate optimal control input"""
+        # load privious control input sequence
+        u = self.u_prev
+
+        # set initial x value from observation
+        x0 = observed_x
+
+        # get the waypoint closest to current vehicle position 
+        self._get_nearest_waypoint(x0[0], x0[1], update_prev_idx=True)
+        if self.prev_waypoints_idx >= self.ref_path.shape[0]-1:
+            print("[ERROR] Reached the end of the reference path.")
+            raise IndexError
+
+        # prepare buffer
+        S = np.zeros((self.K)) # state cost list
+
+        # sample noise
+        epsilon = self._calc_epsilon(self.Sigma, self.K, self.T, self.dim_u) # size is self.K x self.T
+
+        # prepare buffer of sampled control input sequence
+        v = np.zeros((self.K, self.T, self.dim_u)) # control input sequence with noise
+
+        # loop for 0 ~ K-1 samples
+        for k in range(self.K):         
+
+            # set initial(t=0) state x i.e. observed state of the vehicle
+            x = x0
+
+            # loop for time step t = 1 ~ T
+            for t in range(1, self.T+1):
+
+                # get control input with noise
+                if k < (1.0-self.param_exploration)*self.K:
+                    v[k, t-1] = u[t-1] + epsilon[k, t-1] # sampling for exploitation
+                else:
+                    v[k, t-1] = epsilon[k, t-1] # sampling for exploration
+
+                # update x
+                x = self._F(x, self._g(v[k, t-1]))
+
+                # add stage cost
+                S[k] += self._c(x) + self.param_gamma * u[t-1].T @ np.linalg.inv(self.Sigma) @ v[k, t-1]
+
+            # add terminal cost
+            S[k] += self._phi(x)
+
+        # compute information theoretic weights for each sample
+        w = self._compute_weights(S)
+
+        # calculate w_k * epsilon_k
+        w_epsilon = np.zeros((self.T, self.dim_u))
+        for t in range(self.T): # loop for time step t = 0 ~ T-1
+            for k in range(self.K):
+                w_epsilon[t] += w[k] * epsilon[k, t]
+
+        # apply moving average filter for smoothing input sequence
+        w_epsilon = self._moving_average_filter(xx=w_epsilon, window_size=10)
+
+        # update control input sequence
+        u += w_epsilon
+
+        # calculate optimal trajectory
+        optimal_traj = np.zeros((self.T, self.dim_x))
+        if self.visualize_optimal_traj:
+            x = x0
+            for t in range(self.T):
+                x = self._F(x, self._g(u[t-1]))
+                optimal_traj[t] = x
+
+        # calculate sampled trajectories
+        sampled_traj_list = np.zeros((self.K, self.T, self.dim_x))
+        sorted_idx = np.argsort(S) # sort samples by state cost, 0th is the best sample
+        if self.visualze_sampled_trajs:
+            for k in sorted_idx:
+                x = x0
+                for t in range(self.T):
+                    x = self._F(x, self._g(v[k, t-1]))
+                    sampled_traj_list[k, t] = x
+
+        # update privious control input sequence (shift 1 step to the left)
+        self.u_prev[:-1] = u[1:]
+        self.u_prev[-1] = u[-1]
+
+        # return optimal control input and input sequence
+        return u[0], u, optimal_traj, sampled_traj_list
+
+    def _calc_epsilon(self, sigma: np.ndarray, size_sample: int, size_time_step: int, size_dim_u: int) -> np.ndarray:
+        """sample epsilon"""
+        # check if sigma row size == sigma col size == size_dim_u and size_dim_u > 0
+        if sigma.shape[0] != sigma.shape[1] or sigma.shape[0] != size_dim_u or size_dim_u < 1:
+            print("[ERROR] sigma must be a square matrix with the size of size_dim_u.")
+            raise ValueError
+
+        # sample epsilon
+        mu = np.zeros((size_dim_u)) # set average as a zero vector
+        epsilon = np.random.multivariate_normal(mu, sigma, (size_sample, size_time_step))
+        return epsilon
+
+    def _g(self, v: np.ndarray) -> float:
+        """clamp input"""
+        # limit control inputs
+        v[0] = np.clip(v[0], -self.max_steer_abs, self.max_steer_abs) # limit steering input
+        v[1] = np.clip(v[1], -self.max_accel_abs, self.max_accel_abs) # limit acceleraiton input
+        return v
+
+    def _c(self, x_t: np.ndarray) -> float:
+        """calculate stage cost"""
+        # parse x_t
+        x, y, yaw, v = x_t
+        yaw = ((yaw + 2.0*np.pi) % (2.0*np.pi)) # normalize theta to [0, 2*pi]
+
+        # calculate stage cost
+        _, ref_x, ref_y, ref_yaw, ref_v = self._get_nearest_waypoint(x, y)
+        stage_cost = self.stage_cost_weight[0]*(x-ref_x)**2 + self.stage_cost_weight[1]*(y-ref_y)**2 + \
+                     self.stage_cost_weight[2]*(yaw-ref_yaw)**2 + self.stage_cost_weight[3]*(v-ref_v)**2
+        return stage_cost
+
+    def _phi(self, x_T: np.ndarray) -> float:
+        """calculate terminal cost"""
+        # parse x_T
+        x, y, yaw, v = x_T
+        yaw = ((yaw + 2.0*np.pi) % (2.0*np.pi)) # normalize theta to [0, 2*pi]
+
+        # calculate terminal cost
+        _, ref_x, ref_y, ref_yaw, ref_v = self._get_nearest_waypoint(x, y)
+        terminal_cost = self.terminal_cost_weight[0]*(x-ref_x)**2 + self.terminal_cost_weight[1]*(y-ref_y)**2 + \
+                        self.terminal_cost_weight[2]*(yaw-ref_yaw)**2 + self.terminal_cost_weight[3]*(v-ref_v)**2
+        return terminal_cost
+
+    def _get_nearest_waypoint(self, x: float, y: float, update_prev_idx: bool = False):
+        """search the closest waypoint to the vehicle on the reference path"""
+
+        SEARCH_IDX_LEN = 200 # [points] forward search range
+        prev_idx = self.prev_waypoints_idx
+        dx = [x - ref_x for ref_x in self.ref_path[prev_idx:(prev_idx + SEARCH_IDX_LEN), 0]]
+        dy = [y - ref_y for ref_y in self.ref_path[prev_idx:(prev_idx + SEARCH_IDX_LEN), 1]]
+        d = [idx ** 2 + idy ** 2 for (idx, idy) in zip(dx, dy)]
+        min_d = min(d)
+        nearest_idx = d.index(min_d) + prev_idx
+
+        # get reference values of the nearest waypoint
+        ref_x = self.ref_path[nearest_idx,0]
+        ref_y = self.ref_path[nearest_idx,1]
+        ref_yaw = self.ref_path[nearest_idx,2]
+        ref_v = self.ref_path[nearest_idx,3]
+
+        # update nearest waypoint index if necessary
+        if update_prev_idx:
+            self.prev_waypoints_idx = nearest_idx 
+
+        return nearest_idx, ref_x, ref_y, ref_yaw, ref_v
+
+    def Arm_Dynamic(self, q, dq, u):
+    
+        dt = self.delta_t
+        M11 = m1 * lc1 ** 2 + l1 + m2 * \
+            (l1 ** 2 + lc2 ** 2 + 2 * l1 * lc2 * np.cos(q[1])) + l2
+        M22 = m2 * lc2 ** 2 + l2
+        M12 = m2 * l1 * lc2 * np.cos(q[1]) + m2 * lc2 ** 2 + l2
+        M21 = m2 * l1 * lc2 * np.cos(q[1]) + m2 * lc2 ** 2 + l2
+        M = np.array([[M11, M12], [M21, M22]])
+        h = m2 * l1 * lc2 * np.sin(q[1])
+        g1 = m1 * lc1 * g * np.cos(q[0]) + m2 * g * \
+            (lc2 * np.cos(q[0] + q[1]) + l1 * np.cos(q[0]))
+        g2 = m2 * lc2 * g * np.cos(q[0] + q[1])
+        G = np.array([g1, g2])
+        C = np.array([[-h * dq[1], -h * dq[0] - h * dq[1]], [h * dq[0], 0]])
+        ddq = np.linalg.inv(M).dot(u - C.dot(dq) - G)
+        dq = dq + ddq * dt
+        q = q + dq * dt
+        
+
+        return q, dq
+
+    def _F(self, x_t: np.ndarray, v_t: np.ndarray) -> np.ndarray:
+        """calculate next state of the vehicle"""
+        # get previous state variables
+        x, y, yaw, v = x_t
+        steer, accel = v_t
+
+        # prepare params
+        l = self.wheel_base
+        dt = self.delta_t
+
+        # update state variables
+        new_x = x + v * np.cos(yaw) * dt
+        new_y = y + v * np.sin(yaw) * dt
+        new_yaw = yaw + v / l * np.tan(steer) * dt
+        new_v = v + accel * dt
+
+        # return updated state
+        x_t_plus_1 = np.array([new_x, new_y, new_yaw, new_v])
+        return x_t_plus_1
+
+    def _compute_weights(self, S: np.ndarray) -> np.ndarray:
+        """compute weights for each sample"""
+        # prepare buffer
+        w = np.zeros((self.K))
+
+        # calculate rho
+        rho = S.min()
+
+        # calculate eta
+        eta = 0.0
+        for k in range(self.K):
+            eta += np.exp( (-1.0/self.param_lambda) * (S[k]-rho) )
+
+        # calculate weight
+        for k in range(self.K):
+            w[k] = (1.0 / eta) * np.exp( (-1.0/self.param_lambda) * (S[k]-rho) )
+        return w
+
+    def _moving_average_filter(self, xx: np.ndarray, window_size: int) -> np.ndarray:
+        """apply moving average filter for smoothing input sequence
+        Ref. https://zenn.dev/bluepost/articles/1b7b580ab54e95
+        """
+        b = np.ones(window_size)/window_size
+        dim = xx.shape[1]
+        xx_mean = np.zeros(xx.shape)
+
+        for d in range(dim):
+            xx_mean[:,d] = np.convolve(xx[:,d], b, mode="same")
+            n_conv = math.ceil(window_size/2)
+            xx_mean[0,d] *= window_size/n_conv
+            for i in range(1, n_conv):
+                xx_mean[i,d] *= window_size/(i+n_conv)
+                xx_mean[-i,d] *= window_size/(i + n_conv - (window_size % 2)) 
+        return xx_mean
+
 
 class PID(object):
     """
@@ -108,6 +386,8 @@ class PID(object):
 
         # z축 방향의 힘과 모멘트를 리턴
         return np.hstack((Fz, Mr))
+
+
 
 
 class MPC_PY(object):
@@ -367,467 +647,4 @@ class MPC_CA(object):
         return F
 
 
-# class MPC_CA_UAV(object):
-#     def __init__(self, mpc_T, dt, so_path="./nmpc.so"):
-#         """
-#         Nonlinear MPC for quadrotor control
-#         """
-#         self.so_path = so_path
-#         self.params = SYS_PARAMS()
 
-#         # Time constant
-#         self.mpc_T = mpc_T
-#         self._dt = dt
-#         self._N = int(self.mpc_T / self._dt)
-
-#         # constants
-#         self._u_min = 0.0  # -np.inf
-#         self._u_max = 1000.0  # np.inf
-
-#         self._Q_x = np.diag([100, 100, 100, 10, 10, 10, 100, 100, 100, 10, 10, 10])
-#         self._Q_u = np.diag([0.1, 0.1, 0.1, 0.1])
-
-#         # initial state and control action
-#         self._sys_s0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-#         self._sys_u0 = [0.0, 0.0, 0.0, 0.0]
-
-#         self._initDynamics()
-
-#     def _initDynamics(
-#         self,
-#     ):
-#         # state symbolic variables
-#         px, py, pz = ca.SX.sym("px"), ca.SX.sym("py"), ca.SX.sym("pz")
-#         vx, vy, vz = ca.SX.sym("vx"), ca.SX.sym("vy"), ca.SX.sym("vz")
-#         pp, pq, pr = ca.SX.sym("pp"), ca.SX.sym("pq"), ca.SX.sym("pr")
-#         vp, vq, vr = ca.SX.sym("vp"), ca.SX.sym("vq"), ca.SX.sym("vr")
-#         self._x = ca.vertcat(px, py, pz, vx, vy, vz, pp, pq, pr, vp, vq, vr)
-#         self.nx = self._x.numel()
-
-#         wrr, wrl, wlr, wll = (
-#             ca.SX.sym("wrr"),
-#             ca.SX.sym("wrl"),
-#             ca.SX.sym("wlr"),
-#             ca.SX.sym("wll"),
-#         )
-#         self._u = ca.vertcat(wrr, wrl, wlr, wll)
-#         self.nu = self._u.numel()
-
-#         ######################################################################################
-#         total_thrust = self.params["b"] / self.params["mass"] * (wrr + wrl + wlr + wll)
-#         x_dot = ca.vertcat(
-#             vx,
-#             vy,
-#             vz,
-#             (np.cos(pp) * np.sin(pq) * np.cos(pr) + np.sin(pp) * np.sin(pr))
-#             * total_thrust,
-#             (np.cos(pp) * np.sin(pq) * np.sin(pr) - np.sin(pp) * np.cos(pr))
-#             * total_thrust,
-#             -self.params["grav"] + np.cos(pp) * np.cos(pq) * total_thrust,
-#             vp,
-#             vq,
-#             vr,
-#             (
-#                 self.params["Lxx"] * self.params["b"] / self.params["Ixx"] * (wll - wrl)
-#                 + ((self.params["Iyy"] - self.params["Izz"]) / self.params["Ixx"])
-#                 * vp
-#                 * vq
-#             ),
-#             (
-#                 self.params["Lyy"] * self.params["b"] / self.params["Iyy"] * (wrr - wlr)
-#                 + ((self.params["Izz"] - self.params["Ixx"]) / self.params["Iyy"])
-#                 * vr
-#                 * vp
-#             ),
-#             (
-#                 self.params["d"] / self.params["Izz"] * (-wrr + wrl - wlr + wll)
-#                 + ((self.params["Ixx"] - self.params["Iyy"]) / self.params["Izz"])
-#                 * vp
-#                 * vq
-#             ),
-#         )
-#         self.f = ca.Function("f", [self._x, self._u], [x_dot], ["x", "u"], ["ode"])
-
-#         ######################################################################################
-#         # # 상태 벡터 x와 입력 벡터 u의 크기 정의
-#         # # x = ca.MX.sym('x', 12, 1)
-#         # # u = ca.MX.sym('u', 4, 1)
-
-#         # # 시스템 행렬 A와 B 정의
-#         # A = ca.DM.eye(12)
-#         # B = ca.DM.ones(12, 4)
-
-#         # # 시스템의 동역학을 정의
-#         # RHS = A @ self._x + B @ self._u
-
-#         # # 함수 f 생성
-#         # self.f = ca.Function("f", [self._x, self._u], [RHS], ["x", "u"], ["ode"])
-#         ######################################################################################
-
-#         # loss function
-#         # placeholder for the quadratic cost function
-#         Delta_s = ca.SX.sym("Delta_s", self.nx)
-#         Delta_u = ca.SX.sym("Delta_u", self.nu)
-
-#         cost_s = Delta_s.T @ self._Q_x @ Delta_s
-#         cost_u = Delta_u.T @ self._Q_u @ Delta_u
-
-#         f_cost_s = ca.Function("cost_s", [Delta_s], [cost_s])
-#         f_cost_u = ca.Function("cost_u", [Delta_u], [cost_u])
-
-#         # Non-linear Optimization
-#         self.nlp_w = []  # nlp variables
-#         self.nlp_w0 = []  # initial guess of nlp variables
-#         self.lbw = []  # lower bound of the variables, lbw <= nlp_x
-#         self.ubw = []  # upper bound of the variables, nlp_x <= ubw
-
-#         self.mpc_obj = 0  # objective
-#         self.nlp_g = []  # constraint functions
-#         self.lbg = []  # lower bound of constrait functions, lbg < g
-#         self.ubg = []  # upper bound of constrait functions, g < ubg
-
-#         u_min = [self._u_min, self._u_min, self._u_min, self._u_min]
-#         u_max = [self._u_max, self._u_max, self._u_max, self._u_max]
-#         x_bound = ca.inf
-#         x_min = [-x_bound for _ in range(self.nx)]
-#         x_max = [+x_bound for _ in range(self.nx)]
-
-#         g_min = [0 for _ in range(self.nx)]
-#         g_max = [0 for _ in range(self.nx)]
-
-#         # P = ca.SX.sym("P", self._s_dim + (self._s_dim + 3) * self._N + self._s_dim)
-#         P = ca.SX.sym("P", self.nx + self.nx)
-#         X = ca.SX.sym("X", self.nx, self._N + 1)
-#         U = ca.SX.sym("U", self.nu, self._N)
-
-#         F = self.sys_dynamics(self._dt)
-#         fMap = F.map(self._N, "openmp")  # parallel
-#         X_next = fMap(X[:, : self._N], U)
-
-#         # "Lift" initial conditions
-#         self.nlp_w += [X[:, 0]]
-#         self.nlp_w0 += self._sys_s0
-#         self.lbw += x_min
-#         self.ubw += x_max
-
-#         # # starting point.
-#         self.nlp_g += [X[:, 0] - P[0 : self.nx]]
-#         self.lbg += g_min
-#         self.ubg += g_max
-
-#         for k in range(self._N):
-#             self.nlp_w += [U[:, k]]
-#             self.nlp_w0 += self._sys_u0
-#             self.lbw += u_min
-#             self.ubw += u_max
-
-#             delta_s_k = X[:, k + 1] - P[self.nx :]
-#             cost_s_k = f_cost_s(delta_s_k)
-#             delta_u_k = U[:, k]
-#             cost_u_k = f_cost_u(delta_u_k)
-
-#             self.mpc_obj = self.mpc_obj + cost_s_k + cost_u_k
-
-#             # New NLP variable for state at end of interval
-#             self.nlp_w += [X[:, k + 1]]
-#             self.nlp_w0 += self._sys_s0
-#             self.lbw += x_min
-#             self.ubw += x_max
-
-#             # Add equality constraint
-#             self.nlp_g += [X_next[:, k] - X[:, k + 1]]
-#             self.lbg += g_min
-#             self.ubg += g_max
-
-#         # nlp objective
-#         nlp_dict = {
-#             "f": self.mpc_obj,
-#             "x": ca.vertcat(*self.nlp_w),
-#             "p": P,
-#             "g": ca.vertcat(*self.nlp_g),
-#         }
-
-#         ipopt_options = {
-#             "verbose": False,
-#             "ipopt.tol": 1e-4,
-#             "ipopt.acceptable_tol": 1e-4,
-#             "ipopt.max_iter": 100,
-#             "ipopt.warm_start_init_point": "yes",
-#             "ipopt.print_level": 0,
-#             "print_time": False,
-#         }
-
-#         self.solver = ca.nlpsol("solver", "ipopt", nlp_dict, ipopt_options)
-
-#     def solve(self, ref_states):
-
-#         # quad_state = ca.vertcat(self.nlp_w0[:3], self.nlp_w0[:6])
-#         quad_state = ca.vertcat(self.nlp_w0[:12])
-#         traj_state = ca.vertcat(
-#             ref_states[:3],
-#             np.array([0.0, 0.0, 0.0]),
-#             ref_states[3:6],
-#             np.array([0.0, 0.0, 0.0]),
-#         )
-#         # pdb.set_trace()
-#         self.sol = self.solver(
-#             x0=self.nlp_w0,
-#             lbx=self.lbw,
-#             ubx=self.ubw,
-#             lbg=self.lbg,
-#             ubg=self.ubg,
-#             p=ca.vertcat(quad_state, traj_state),
-#         )
-
-#         sol_x0 = self.sol["x"].full()
-#         opt_u = sol_x0[self.nx : self.nx + self.nu]
-
-#         # Warm initialization
-#         self.nlp_w0 = list(sol_x0[self.nx + self.nu : 2 * (self.nx + self.nu)]) + list(
-#             sol_x0[self.nx + self.nu :]
-#         )
-
-#         x0_array = np.reshape(sol_x0[: -self.nx], newshape=(-1, self.nx + self.nu))
-
-#         # return optimal action, and a sequence of predicted optimal trajectory.
-#         return opt_u, x0_array
-
-#     def sys_dynamics(self, dt):
-#         X0 = ca.SX.sym("X", self.nx)
-#         U = ca.SX.sym("U", self.nu)
-
-#         X = X0
-#         k1 = dt * self.f(X, U)
-#         k2 = dt * self.f(X + 0.5 * k1, U)
-#         k3 = dt * self.f(X + 0.5 * k2, U)
-#         k4 = dt * self.f(X + k3, U)
-
-#         X = X + (k1 + 2 * k2 + 2 * k3 + k4) / 6
-#         F = ca.Function("F", [X0, U], [X])
-#         return F
-
-
-class MPC_CA_UAV(object):
-    def __init__(self, mpc_T, dt, so_path="./nmpc.so"):
-        """
-        Nonlinear MPC for quadrotor control
-        """
-        self.so_path = so_path
-
-        # Time constant
-        self.mpc_T = mpc_T
-        self._dt = dt
-        self._N = int(self.mpc_T / self._dt)
-
-        self._gz = 9.81
-
-        # Quadrotor constant
-        self._w_max_yaw = 6.0
-        self._w_max_xy = 6.0
-        self._thrust_min = 0.0
-        self._thrust_max = 20.0
-
-        self._Q_x = np.diag([100, 100, 100, 0, 0, 0, 0, 0.1, 0.1, 0.1])
-        self._Q_u = np.diag([0.1, 0.1, 0.1, 0.1])
-
-        # initial state and control action
-        self._sys_s0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        self._sys_u0 = [0.0, 0.0, 0.0, 0.0]
-
-        self._initDynamics()
-
-    def _initDynamics(
-        self,
-    ):
-        # state symbolic variables
-        px, py, pz = ca.SX.sym("px"), ca.SX.sym("py"), ca.SX.sym("pz")
-        qw, qx, qy, qz = (
-            ca.SX.sym("qw"),
-            ca.SX.sym("qx"),
-            ca.SX.sym("qy"),
-            ca.SX.sym("qz"),
-        )
-        vx, vy, vz = ca.SX.sym("vx"), ca.SX.sym("vy"), ca.SX.sym("vz")
-        self._x = ca.vertcat(px, py, pz, qw, qx, qy, qz, vx, vy, vz)
-        self.nx = self._x.numel()
-
-        thrust, wx, wy, wz = (
-            ca.SX.sym("thrust"),
-            ca.SX.sym("wx"),
-            ca.SX.sym("wy"),
-            ca.SX.sym("wz"),
-        )
-        self._u = ca.vertcat(thrust, wx, wy, wz)
-        self.nu = self._u.numel()
-
-        x_dot = ca.vertcat(
-            vx,
-            vy,
-            vz,
-            0.5 * (-wx * qx - wy * qy - wz * qz),
-            0.5 * (wx * qw + wz * qy - wy * qz),
-            0.5 * (wy * qw - wz * qx + wx * qz),
-            0.5 * (wz * qw + wy * qx - wx * qy),
-            2 * (qw * qy + qx * qz) * thrust,
-            2 * (qy * qz - qw * qx) * thrust,
-            (qw * qw - qx * qx - qy * qy + qz * qz) * thrust - self._gz,
-        )
-        self.f = ca.Function("f", [self._x, self._u], [x_dot], ["x", "u"], ["ode"])
-
-        # loss function
-        # placeholder for the quadratic cost function
-        Delta_s = ca.SX.sym("Delta_s", self.nx)
-        Delta_u = ca.SX.sym("Delta_u", self.nu)
-
-        cost_s = Delta_s.T @ self._Q_x @ Delta_s
-        cost_u = Delta_u.T @ self._Q_u @ Delta_u
-
-        f_cost_s = ca.Function("cost_s", [Delta_s], [cost_s])
-        f_cost_u = ca.Function("cost_u", [Delta_u], [cost_u])
-
-        # Non-linear Optimization
-        self.nlp_w = []  # nlp variables
-        self.nlp_w0 = []  # initial guess of nlp variables
-        self.lbw = []  # lower bound of the variables, lbw <= nlp_x
-        self.ubw = []  # upper bound of the variables, nlp_x <= ubw
-
-        self.mpc_obj = 0  # objective
-        self.nlp_g = []  # constraint functions
-        self.lbg = []  # lower bound of constrait functions, lbg < g
-        self.ubg = []  # upper bound of constrait functions, g < ubg
-
-        u_min = [self._thrust_min, -self._w_max_xy, -self._w_max_xy, -self._w_max_yaw]
-        u_max = [self._thrust_max, self._w_max_xy, self._w_max_xy, self._w_max_yaw]
-        x_bound = ca.inf
-        x_min = [-x_bound for _ in range(self.nx)]
-        x_max = [+x_bound for _ in range(self.nx)]
-
-        g_min = [0 for _ in range(self.nx)]
-        g_max = [0 for _ in range(self.nx)]
-
-        P = ca.SX.sym("P", self.nx + self.nx)
-        X = ca.SX.sym("X", self.nx, self._N + 1)
-        U = ca.SX.sym("U", self.nu, self._N)
-
-        F = self.sys_dynamics(self._dt)
-        fMap = F.map(self._N, "openmp")  # parallel
-        X_next = fMap(X[:, : self._N], U)
-
-        # "Lift" initial conditions
-        self.nlp_w += [X[:, 0]]
-        self.nlp_w0 += self._sys_s0
-        self.lbw += x_min
-        self.ubw += x_max
-
-        # # starting point.
-        self.nlp_g += [X[:, 0] - P[0 : self.nx]]
-        self.lbg += g_min
-        self.ubg += g_max
-
-        for k in range(self._N):
-            self.nlp_w += [U[:, k]]
-            self.nlp_w0 += self._sys_u0
-            self.lbw += u_min
-            self.ubw += u_max
-
-            delta_s_k = X[:, k + 1] - P[self.nx :]
-            cost_s_k = f_cost_s(delta_s_k)
-            delta_u_k = U[:, k]
-            cost_u_k = f_cost_u(delta_u_k)
-
-            self.mpc_obj = self.mpc_obj + cost_s_k + cost_u_k
-
-            # New NLP variable for state at end of interval
-            self.nlp_w += [X[:, k + 1]]
-            self.nlp_w0 += self._sys_s0
-            self.lbw += x_min
-            self.ubw += x_max
-
-            # Add equality constraint
-            self.nlp_g += [X_next[:, k] - X[:, k + 1]]
-            self.lbg += g_min
-            self.ubg += g_max
-
-        # nlp objective
-        nlp_dict = {
-            "f": self.mpc_obj,
-            "x": ca.vertcat(*self.nlp_w),
-            "p": P,
-            "g": ca.vertcat(*self.nlp_g),
-        }
-
-        ipopt_options = {
-            "verbose": False,
-            "ipopt.tol": 1e-4,
-            "ipopt.acceptable_tol": 1e-4,
-            "ipopt.max_iter": 100,
-            "ipopt.warm_start_init_point": "yes",
-            "ipopt.print_level": 0,
-            "print_time": False,
-        }
-
-        self.solver = ca.nlpsol("solver", "ipopt", nlp_dict, ipopt_options)
-
-    def solve(self, ref_states):
-
-        # quad_state = ca.vertcat(self.nlp_w0[:3], self.nlp_w0[:6])
-        quad_state = ca.vertcat(self.nlp_w0[:10])
-        traj_state = ca.vertcat(
-            ref_states[:3],
-            self.EulerToQuat(ref_states[3:6]),
-            np.array([0.0, 0.0, 0.0]),
-        )
-        # pdb.set_trace()
-        self.sol = self.solver(
-            x0=self.nlp_w0,
-            lbx=self.lbw,
-            ubx=self.ubw,
-            lbg=self.lbg,
-            ubg=self.ubg,
-            p=ca.vertcat(quad_state, traj_state),
-        )
-
-        sol_x0 = self.sol["x"].full()
-        opt_u = sol_x0[self.nx : self.nx + self.nu]
-
-        # Warm initialization
-        self.nlp_w0 = list(sol_x0[self.nx + self.nu : 2 * (self.nx + self.nu)]) + list(
-            sol_x0[self.nx + self.nu :]
-        )
-
-        x0_array = np.reshape(sol_x0[: -self.nx], newshape=(-1, self.nx + self.nu))
-
-        # return optimal action, and a sequence of predicted optimal trajectory.
-        return opt_u, x0_array
-
-    def sys_dynamics(self, dt):
-        X0 = ca.SX.sym("X", self.nx)
-        U = ca.SX.sym("U", self.nu)
-
-        X = X0
-        k1 = dt * self.f(X, U)
-        k2 = dt * self.f(X + 0.5 * k1, U)
-        k3 = dt * self.f(X + 0.5 * k2, U)
-        k4 = dt * self.f(X + k3, U)
-
-        X = X + (k1 + 2 * k2 + 2 * k3 + k4) / 6
-        F = ca.Function("F", [X0, U], [X])
-        return F
-
-    def EulerToQuat(self, euler):
-        """
-        Convert Quaternion to Euler Angles
-        """
-        roll, pitch, yaw = euler[0], euler[1], euler[2]
-        cr = np.cos(roll * 0.5)
-        sr = np.sin(roll * 0.5)
-        cp = np.cos(pitch * 0.5)
-        sp = np.sin(pitch * 0.5)
-        cy = np.cos(yaw * 0.5)
-        sy = np.sin(yaw * 0.5)
-
-        quat_w = cr * cp * cy + sr * sp * sy
-        quat_x = sr * cp * cy - cr * sp * sy
-        quat_y = cr * sp * cy + sr * cp * sy
-        quat_z = cr * cp * sy - sr * sp * cy
-        return [quat_w, quat_x, quat_y, quat_z]
