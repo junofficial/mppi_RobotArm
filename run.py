@@ -6,40 +6,42 @@ from utils import *
 from control import MPPIControllerForPathTracking
 params = SYS_PARAMS()
 sim_time = 10 # 
-dt = params['Ts']
+dt = 0.02
+#dt = params['Ts']
 #iter = sim_time/0.2
-iter = 2000
+iter = 100
 q = np.array([1.152197950636272505e+00, -1.266103672779498979e+00])
-dq = np.array([0.1, 0.2])
+#q = np.array([0.0,0.0])
+dq = np.array([0.5, 0.5])
 
 trajName = 'circle'
 isDesturbance = 0
 
-ref_path = np.loadtxt('trajectory.txt')
-#ref_path = ref_path[:3050]
+ref_path = np.loadtxt('trajectory1.txt')
+#ref_path = ref_path[:,2:4]
 
 print(ref_path.shape)
-delta_t = 0.05 # [sec]
+delta_t = 0.02 # [sec]
 sim_steps = 10 # [steps]
-print(f"ref_path = {ref_path}")
-print(f"ref_path = {ref_path[:,0]}")
-print(f"ref_path = {ref_path[:,1]}")
-print(f"ref_path = {ref_path[:,2]}")
-print(f"ref_path = {ref_path[:,3]}")
+#print(f"ref_path = {ref_path}")
+#print(f"ref_path = {ref_path[:,0]}")
+#print(f"ref_path = {ref_path[:,2:4]}")
+#print(f"ref_path = {ref_path[:,2]}")
+#print(f"ref_path = {ref_path[:,3]}")
 
 state = [q[0],q[1],dq[0],dq[1]]
 
 mppi = MPPIControllerForPathTracking(
-    delta_t = delta_t*2.0, # [s]
+    delta_t = delta_t*2, # [s]
     ref_path = ref_path, # ndarray, size is <num_of_waypoints x 2>
     horizon_step_T = 20, # [steps]
-    number_of_samples_K = 3000, # [samples]
+    number_of_samples_K = 500, # [samples]
     param_exploration = 0.0,
     param_lambda = 100.0,
     param_alpha = 0.98,
-    sigma = np.array([[0.075, 0.0], [0.0, 2.0]]),
-    stage_cost_weight = np.array([10.0, 10.0, 10.0, 10.0]), # weight for [x, y, yaw, v]
-    terminal_cost_weight = np.array([10.0, 10.0, 10.0, 10.0]), # weight for [x, y, yaw, v]
+    sigma = np.array([[0.4, 0.0], [0.0, 0.4]]),
+    stage_cost_weight = np.array([1.0, 1.0, 1.0, 1.0]), # weight for [x, y, yaw, v]
+    terminal_cost_weight = np.array([2.0, 2.0, 2.0, 2.0]), # weight for [x, y, yaw, v]
     visualze_sampled_trajs = True
 )
 
@@ -79,7 +81,7 @@ for k in range(1, int(iter) + 1): # 여기에서
     u_rec[k, :] = u
     t_rec[k] = t
     #if sampled_traj_list.any():
-    if True:
+    if True:     
         min_alpha_value = 0.25
         max_alpha_value = 0.35
         fig, ax = plt.subplots()  # create figure and axis objects
@@ -91,11 +93,13 @@ for k in range(1, int(iter) + 1): # 여기에서
             sampled_traj_x_offset = np.ravel(sampled_traj[:, 0])
             #sampled_traj_y_offset = np.ravel(sampled_traj[:, 1]) - np.full(sampled_traj.shape[0], y2)
             sampled_traj_y_offset = np.ravel(sampled_traj[:, 1])
-            ax.plot(sampled_traj_x_offset, sampled_traj_y_offset, color='gray', linestyle="solid", linewidth=0.2, zorder=4, alpha=alpha_value)
-            
-        pink_traj = optimal_traj  # Example pink trajectory
-        ax.plot(pink_traj[:, 0], pink_traj[:, 1], color='red', linestyle="solid", linewidth=3, zorder=4)
-
+            x_sample = [1 * np.cos(q1) + 1 * np.cos(q1 + q2) for (q1, q2) in zip(sampled_traj_x_offset,sampled_traj_y_offset)]
+            y_sample = [1 * np.sin(q1) + 1 * np.sin(q1 + q2) for (q1, q2) in zip(sampled_traj_x_offset,sampled_traj_y_offset)]
+            ax.plot(x_sample, y_sample, color='gray', linestyle="solid", linewidth=0.2, zorder=4, alpha=alpha_value)
+        x1 = [1 * np.cos(q1) + 1 * np.cos(q1 + q2) for q1,q2 in zip(optimal_traj[:,0],optimal_traj[:,1])]
+        y1 = [1 * np.sin(q1) + 1 * np.sin(q1 + q2) for q1,q2 in zip(optimal_traj[:,0],optimal_traj[:,1])]
+        ax.plot(x1, y1, color='red', linestyle="solid", linewidth=1, zorder=4)
+        ax.plot(x_sample[0], y_sample[0], marker='o', linestyle='-', color='b')
         ax.set_aspect('equal', adjustable='box')  # set equal aspect ratio
         ax.set_xlabel('X Label')  # set x-axis label
         ax.set_ylabel('Y Label')  # set y-axis label

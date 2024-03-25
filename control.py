@@ -101,14 +101,14 @@ class MPPIControllerForPathTracking():
                 # update x
                 x = self._F(x, self._g(v[k, t-1])) #q1,q2,dq1,dq2
                 # add stage cost
-                S[k] += self._c(x) + self.param_gamma * u[t-1].T @ np.linalg.inv(self.Sigma) @ v[k, t-1]
+                #S[k] += self._c(x) + self.param_gamma * u[t-1].T @ np.linalg.inv(self.Sigma) @ v[k, t-1] # 아님
 
             # add terminal cost
-            S[k] += self._phi(x)
+            #S[k] += self._phi(x) # 아님
         #print(f"1     S = {S}")
         # compute information theoretic weights for each sample
         w = self._compute_weights(S)
-        #print(f"2     w = {w}")
+        print(f"2     w = {w}")
         # calculate w_k * epsilon_k
         w_epsilon = np.zeros((self.T, self.dim_u))
         for t in range(self.T): # loop for time step t = 0 ~ T-1
@@ -116,11 +116,11 @@ class MPPIControllerForPathTracking():
                 w_epsilon[t] += w[k] * epsilon[k, t]
 
         # apply moving average filter for smoothing input sequence
-        w_epsilon = self._moving_average_filter(xx=w_epsilon, window_size=10)
-        #print(f"3     w_epsilon = {w_epsilon}")
+        #w_epsilon = self._moving_average_filter(xx=w_epsilon, window_size=10)
+        print(f"3     w_epsilon = {w_epsilon}")
         # update control input sequence
         u += w_epsilon
-        #print(f"4     u = {u}")
+        print(f"4     u = {u}")
         # calculate optimal trajectory
         optimal_traj = np.zeros((self.T, self.dim_x))
         if self.visualize_optimal_traj:
@@ -195,7 +195,7 @@ class MPPIControllerForPathTracking():
     def _get_nearest_waypoint(self, q1: float, q2: float, update_prev_idx: bool = False):
         """search the closest waypoint to the vehicle on the reference path"""
         
-        SEARCH_IDX_LEN = 200 # [points] forward search range
+        SEARCH_IDX_LEN = 100 # [points] forward search range
         prev_idx = self.prev_waypoints_idx
         x = self.l1 * np.cos(q1) + self.l2 * np.cos(q1 + q2)
         y = self.l1 * np.sin(q1) + self.l2 * np.sin(q1 + q2)
@@ -254,6 +254,7 @@ class MPPIControllerForPathTracking():
     def _F(self, x_t: np.ndarray, v_t: np.ndarray) -> np.ndarray:
         q = x_t[0:2]
         dq = x_t[2:4]
+        u = v_t
         #print(f"q = {q}")
         #print(f"dq = {dq}")
         dt = self.delta_t
@@ -269,9 +270,6 @@ class MPPIControllerForPathTracking():
         g2 = m2 * lc2 * g * np.cos(q[0] + q[1])
         G = np.array([g1, g2])
         C = np.array([[-h * dq[1], -h * dq[0] - h * dq[1]], [h * dq[0], 0]])
-        
-        u = np.dot(M, v_t) + np.dot(C, dq) + G
-        
         ddq = np.linalg.inv(M).dot(u - C.dot(dq) - G)
         #print(f"u = {u}")
         #print(f"before ddq = {ddq}")
